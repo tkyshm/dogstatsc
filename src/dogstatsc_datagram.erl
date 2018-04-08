@@ -1,13 +1,17 @@
+%%% @doc
+%%%
+%%% A DogStatsD datagram module.
+%%%
+%%% @end
+%%% @reference
+%%% See <a href="https://docs.datadoghq.com/developers/dogstatsd/#datagram-format"> Datagram  Format</a>
 -module(dogstatsc_datagram).
 
--export([new_metrics/3,
+-export([new_metrics/4,
          new_events/3,
-         new_service_check/3]).
+         new_service_check/3,
+         encode/1]).
 
-%% @doc
-%% https://docs.datadoghq.com/developers/dogstatsd/#datagram-format
-%% Datagram Format
-%%
 %% Metrics
 %%
 %% metric.name:value|type|@sample_rate|#tag1:value,tag2
@@ -18,13 +22,12 @@
 %% sample rate (optional) — a float between 0 and 1, inclusive. Only works with counter, histogram, and timer metrics. Default is 1 (i.e. sample 100% of the time).
 %% tags (optional) — a comma separated list of tags. Use colons for key/value tags, i.e. env:prod. The key device is reserved; Datadog drops a user-added tag like device:foobar.
 %%
-%% @end
 -record(metrics, {
-    metric = undefined :: binary() | undefined,
+    name = undefined :: string() | undefined,
     value = undefined :: float() | undefined,
-    type = c :: c | g | ms | h | s,
-    rate = 1.0 :: float(),
-    tags = undefined :: binary() | undefined
+    type = c :: metric_type(),
+    rate = undefined :: float() | undefined,
+    tags = undefined :: tags() | undefined
 }).
 
 %% Events
@@ -44,15 +47,15 @@
 %% |#tag1:value1,tag2,tag3:value3... (optional)— The colon in tags is part of the tag list string and has no parsing purpose like for the other parameters. No default.
 %%
 -record(events, {
-    title = undefined :: binary() | undefined,
-    text = undefined :: binary() | undefined,
+    title = undefined :: string() | undefined,
+    text = undefined :: string() | undefined,
     timestamp = 0 :: non_neg_integer(),
-    hostname = undefined,
-    aggregation_key = undefined,
-    priority = normal :: normal | low,
-    source_type_name = undefined,
-    alert_type = info :: info | warning | error | success,
-    tags = <<>> :: binary()
+    hostname = undefined :: string() | undefined,
+    aggregation_key = undefined :: string() | undefined,
+    priority = normal :: priority(),
+    source_type_name = undefined :: string() | undefined,
+    alert_type = info :: alert_type(),
+    tags = undefined :: tags() | undefined
 }).
 
 %% Service Check
@@ -67,57 +70,223 @@
 %% #tag1:value1,tag2,tag3:value3,... (optional) — The colon in tags is part of the tag list string and has no parsing purpose like for the other parameters.No default.
 %% m:service_check_message (optional) — Add a message describing the current state of the service check. This field MUST be positioned last among the metadata fields. No default.
 -record(service_check, {
-    name = undefined :: binary() | undefined,
-    status = 0 :: 0 | 1 | 2 | 3, % 0=OK, 1=warning, 2=critical, 3=unknown
+    name = undefined :: string() | undefined,
+    status = status_unknown :: status(),
     timestamp = 0 :: non_neg_integer(),
-    hostname = undefined :: binary(),
-    tags = <<>> :: binary(),
-    message = <<>> :: binary()
+    hostname = undefined :: string() | undefined,
+    tags = undefined :: tags() | undefined,
+    message = undefined :: string() | undefined
 }).
 
 
 -export_type([metrics/0,
               events/0,
-              service_check/0]).
+              service_check/0,
+              request/0,
+              status/0,
+              metric_type/0]).
+
+-type status() :: status_ok | status_warn | status_crit | status_unknown.
+-type metric_type() :: c | g | ms | h | s.
+-type alert_type() :: info | warning | error | success.
+-type priority() :: normal | low.
+-type raw_request() :: binary().
+-type tags() :: [{atom()|string()|binary(), string()}].
 
 -opaque metrics() :: #metrics{}.
 -opaque events() :: #events{}.
 -opaque service_check() :: #service_check{}.
+-opaque request() :: metrics() | events() | service_check().
 
 %% @doc
+%% new a metrics request record
 %% @end
--spec new_metrics(Name :: binary(), Params :: map(), Opts :: map()) -> metrics() | {error, any()}.
-new_metrics(Name, Params, Opts) ->
-    % TODO: paramsをパース
+-spec new_metrics(Name :: string(), Type :: metric_type(), Value :: float(), Opts :: map()) -> metrics().
+new_metrics(Name, Type, Value, Opts) ->
     #metrics{
-       metric = Name,
-       value = maps:get(value, Params),
-       type = maps:get(type, Params),
+       name = Name,
+       value = Value,
+       type = Type,
        rate = maps:get(rate, Opts, 1.0),
        tags = maps:get(tags, Opts, undefined)}.
 
 %% @doc
+%% new a events request record
 %% @end
--spec new_events(Name :: binary(), Params :: map(), Opts :: map()) -> events() | {error, any()}.
-new_events(Name, Params, Opts) ->
+-spec new_events(Name :: string(), Text :: string(), Opts :: map()) -> events().
+new_events(Name, Text, Opts) ->
     #events{
        title = Name,
-       text = maps:get(text, Params),
+       text = Text,
        timestamp = maps:get(timestamp, Opts, os:system_time(seconds)),
        hostname = maps:get(hostname, Opts, undefined),
        aggregation_key = maps:get(aggregation_key, Opts, undefined),
        priority = maps:get(priority, Opts, normal),
-       source_type_name = map:get(source_type_name, Opts, undefined),
-       alert_type = map:get(alert_type, Opts, info),
-       tags = maps:get(tags, Opts, <<>>)}.
+       source_type_name = maps:get(source_type_name, Opts, undefined),
+       alert_type = maps:get(alert_type, Opts, info),
+       tags = maps:get(tags, Opts, undefined)}.
 
 %% @doc
+%% new a service check request record.
 %% @end
--spec new_service_check(Name :: binary(), Params :: map(), Opts :: map()) -> service_check() | {error, any()}.
-new_service_check(Name, Params, Opts) ->
+-spec new_service_check(Name :: string(), Status :: status(), Opts :: map()) -> service_check().
+new_service_check(Name, Status, Opts) ->
     #service_check{
        name = Name,
-       status = maps:get(status, Params),
-       timestamp = maps:get(type, Opts, os:system_time(seconds)),
-       tags = maps:get(rate, Opts, <<>>),
-       message = maps:get(tags, Opts, <<>>)}.
+       status = validate_status(Status),
+       hostname = maps:get(hostname, Opts, undefined),
+       timestamp = maps:get(timestamp, Opts, os:system_time(seconds)),
+       tags = maps:get(tags, Opts, undefined),
+       message = maps:get(message, Opts, undefined)}.
+
+%% @doc
+%% encode request for DogStatsD
+%% @end
+-spec encode(request()) -> raw_request().
+encode(Metric = #metrics{}) ->
+    % metric.name:value|type|@sample_rate|#tag1:value,tag2
+    encode_metric(Metric);
+encode(Events = #events{}) ->
+    encode_events(Events);
+encode(SC = #service_check{}) ->
+    encode_service_check(SC).
+
+%% @doc
+%% @private
+%% encode metric
+%% @end
+encode_metric(#metrics{name = undefined}) -> throw(name_is_undefined);
+encode_metric(#metrics{value = undefined}) -> throw(value_is_undefined);
+encode_metric(#metrics{name = Name, value = Val, type = Typ, rate = undefined, tags = undefined}) ->
+    list_to_binary(io_lib:format("~ts:~p|~p", [Name, Val, Typ]));
+encode_metric(#metrics{name = Name, value = Val, type = Typ, rate = Rate, tags = undefined}) ->
+    list_to_binary(io_lib:format("~ts:~p|~p|@~p", [Name, Val, Typ, Rate]));
+encode_metric(#metrics{name = Name, value = Val, type = Typ, rate = undefined, tags = Tags}) ->
+    Str = io_lib:format("~ts:~p|~p|@1.0~ts", [Name, Val, Typ, to_tags(Tags)]),
+    list_to_binary(Str);
+encode_metric(#metrics{name = Name, value = Val, type = Typ, rate = Rate, tags = Tags}) ->
+    Str = io_lib:format("~ts:~p|~p|@~p~ts", [Name, Val, Typ, Rate, to_tags(Tags)]),
+    list_to_binary(Str).
+
+%% @doc
+%% @private
+%% encode events
+%% @end
+encode_events(#events{title = undefined}) -> throw(name_is_undefined);
+encode_events(#events{text = undefined}) -> throw(value_is_undefined);
+encode_events(#events{title = Title,
+                      text = Txt,
+                      timestamp = TS,
+                      hostname = Hostname,
+                      aggregation_key = AggrKey,
+                      priority = Priority,
+                      source_type_name = SrcTyp,
+                      alert_type = AlertTyp,
+                      tags = Tags}) ->
+
+    TxtLen = length(Txt),
+    TitleLen = length(Title),
+
+    HeadList = lists:reverse(["_e{", TitleLen, ",", TxtLen, "}:", Title, "|", Txt, "|d:", TS]),
+
+    WithHost =
+    case Hostname of
+        undefined ->
+            HeadList;
+        Hostname ->
+            [Hostname, "|h:" | HeadList]
+    end,
+
+    WithAggrKey =
+    case AggrKey of
+        undefined ->
+            WithHost;
+        AggrKey ->
+            [AggrKey, "|k:" | WithHost]
+    end,
+
+    WithPriority = [Priority, "|p:"| WithAggrKey],
+
+    WithSrcType =
+    case SrcTyp of
+        undefined ->
+            WithPriority;
+        SrcTyp ->
+            [SrcTyp, "|s:" | WithPriority]
+    end,
+
+    WithAlert = [AlertTyp, "|t:" | WithSrcType],
+
+    WithTags =
+    case Tags of
+        undefined ->
+            WithAlert;
+        Tags ->
+            [to_tags(Tags) | WithAlert]
+    end,
+
+    IOList = lists:reverse(WithTags),
+
+    list_to_binary(lists:concat(IOList)).
+
+
+%% @doc
+%% @private
+%% encode service_check
+%% @end
+encode_service_check(#service_check{name = undefined}) -> throw(name_is_undefined);
+encode_service_check(#service_check{name = Name, status = Status, timestamp = TS, hostname = Hostname, tags = Tags, message = Msg}) ->
+    EncodedStatus =
+    case Status of
+        status_ok -> 0;
+        status_warn -> 1;
+        status_crit -> 2;
+        status_unknown -> 3
+    end,
+
+    HeadList = lists:reverse(["_sc|", Name, "|", EncodedStatus, "|d:", TS]),
+
+    WithHost =
+    case Hostname of
+        undefined ->
+            HeadList;
+        Hostname ->
+            [Hostname, "|h:" | HeadList]
+    end,
+
+    WithTags =
+    case Tags of
+        undefined ->
+            WithHost;
+        Tags ->
+            [to_tags(Tags) | WithHost]
+    end,
+
+    WithMsg =
+    case Msg of
+        undefined ->
+            WithTags;
+        Msg ->
+            [Msg, "|m:"|WithTags]
+    end,
+
+    IOList = lists:reverse(WithMsg),
+
+    list_to_binary(lists:concat(IOList)).
+
+%% @doc
+%% @private
+%% validate service check status
+%% @end
+validate_status(status_ok) -> status_ok;
+validate_status(status_warn) -> status_warn;
+validate_status(status_crit) -> status_crit;
+validate_status(_) -> status_unknown.
+
+to_tags(Tags) ->
+    lists:concat(to_iolist_tags(lists:reverse(Tags), [])).
+
+to_iolist_tags([{Key, Value}], Acc) ->
+    ["|#", Key, ":", Value|Acc];
+to_iolist_tags([{Key, Value}|Tags], Acc) ->
+    to_iolist_tags(Tags, [",", Key, ":", Value|Acc]).

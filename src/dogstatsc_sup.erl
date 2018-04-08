@@ -15,6 +15,8 @@
 
 -define(SERVER, ?MODULE).
 
+-include("dogstatsc.hrl").
+
 %%====================================================================
 %% API functions
 %%====================================================================
@@ -28,7 +30,25 @@ start_link() ->
 
 %% Child :: {Id,StartFunc,Restart,Shutdown,Type,Modules}
 init([]) ->
-    {ok, { {one_for_all, 0, 1}, []} }.
+    SupFlags = #{
+      strategy  => simple_one_for_one,
+      intensity => 1000,
+      period    => 3600
+     },
+
+    Host = application:get_env(dogstatsc, host, "localhost"),
+    Port = application:get_env(dogstatsc, port, ?DOGSTATSD_PORT),
+
+    Spec = #{
+      id       => 'dogstatsc_conn',
+      start    => {'dogstatsc_conn', start_link, [Host, Port]},
+      restart  => permanent,
+      shutdown => 2000,
+      type     => worker,
+      modules  => ['dogstatsc_conn']
+     },
+
+    {ok, {SupFlags, [Spec]}}.
 
 %%====================================================================
 %% Internal functions

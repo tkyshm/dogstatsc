@@ -11,13 +11,14 @@
 -behaviour(gen_statem).
 
 %% API
--export([start_link/0]).
+-export([start_link/2]).
 
 %% gen_statem callbacks
 -export([
          init/1,
+         callback_mode/0,
          format_status/2,
-         connected/3,
+         opened/3,
          closed/3,
          handle_event/4,
          terminate/3,
@@ -26,12 +27,27 @@
 
 -define(SERVER, ?MODULE).
 
--define(DEFAULT_FLUSH_INTERVAL, 10000).
+-define(UDP_OPTS, [binary]).
 
 -record(state, {
-    buffer = [],
-    socket = undefined :: inet:socket() | undefined
+    buffer = [] :: [binary()],
+    sock = undefined :: inet:socket() | undefined,
+    host = "localhost" :: string(),
+    port = 0 :: inet:port_number()
 }).
+
+-type action() :: {{timeout, reopen}, non_neg_integer(), {reopen, integer()}}.
+-type actions() :: [action()].
+-type conn_state() :: #state{}.
+-type request() :: term().
+
+-type opened_event() :: cast.
+-type closed_event() :: {timeout, open} | cast.
+
+-type opened_request() :: {send, request()}.
+-type closed_request() :: {send, request()} | open | {reopen, integer()}.
+
+-type state() :: opened | closed.
 
 %%%===================================================================
 %%% API
@@ -42,11 +58,14 @@
 %% initialize. To ensure a synchronized start-up procedure, this
 %% function does not return until Module:init/1 has returned.
 %%
-%% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
+%% Host: DogStatsD hostname
+%% Port: DogStatsD port number
+%%
+%% @spec start_link(Host, Port) -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_link() ->
-    gen_statem:start_link({local, ?SERVER}, ?MODULE, [], []).
+start_link(Host, Port) ->
+    gen_statem:start_link(?MODULE, [Host, Port], []).
 
 %%%===================================================================
 %%% gen_statem callbacks
@@ -65,10 +84,9 @@ start_link() ->
 %%                     {stop, StopReason}
 %% @end
 %%--------------------------------------------------------------------
-init([]) ->
-    % TODO connect action
-    % {ok, state_name, #state{}}
-    {ok, closed, #state{}, [{next_event, cast, connect}]}.
+init([Host, Port]) ->
+    dogstatsc_pool:insert(self()),
+    {ok, closed, #state{host = Host, port = Port}, [{next_event, cast, open}]}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -77,54 +95,45 @@ init([]) ->
 %% (2) when gen_statem terminates abnormally.
 %% This callback is optional.
 %%
-%% @spec format_status(Opt, [PDict, StateName, State]) -> term()
 %% @end
 %%--------------------------------------------------------------------
 format_status(_Opt, [_PDict, _StateName, _State]) ->
     Status = some_term,
     Status.
 
-%%--------------------------------------------------------------------
+callback_mode() -> state_functions.
+
 %% @private
-%% @doc
-%% There should be one instance of this function for each possible
-%% state name.  If callback_mode is statefunctions, one of these
-%% functions is called when gen_statem receives and event from
-%% call/2, cast/2, or as a normal process message.
 %%
-%% @spec state_name(Event, From, State) ->
-%%                   {next_state, NextStateName, NextState} |
-%%                   {next_state, NextStateName, NextState, Actions} |
-%%                   {stop, Reason, NewState} |
-%%    				 stop |
-%%                   {stop, Reason :: term()} |
-%%                   {stop, Reason :: term(), NewData :: data()} |
-%%                   {stop_and_reply, Reason, Replies} |
-%%                   {stop_and_reply, Reason, Replies, NewState} |
-%%                   {keep_state, NewData :: data()} |
-%%                   {keep_state, NewState, Actions} |
-%%                   keep_state_and_data |
-%%                   {keep_state_and_data, Actions}
+%% @doc
 %% @end
-%%--------------------------------------------------------------------
+-spec opened(opened_event(), opened_request(), conn_state()) -> {next_state, state(), conn_state()} |
+                                                                {next_state, state(), conn_state(), actions()}.
+opened(cast, {send, Req}, State = #state{buffer = Buff, sock = Sock, host = Host, port = Port}) ->
+    % io:format("request: ~p~n", [Req]),
+    Data = dogstatsc_datagram:encode(Req),
+    case send(Sock, Host, Port, lists:reverse(Buff), Data) of
+        ok ->
+            {next_state, opened, State#state{buffer = []}};
+        {error, closed, NewBuff} ->
+            error_logger:error_msg("send failed: closed"),
+            {next_state, closed, State#state{buffer = [Data|NewBuff]}, reopen_actions(0)};
+        {error, Reason, NewBuff} ->
+            error_logger:error_msg("send failed: ~p", [Reason]),
+            {next_state, closed, State#state{buffer = [Data|NewBuff]}}
+    end.
 
-%% connected state
-connected({cast, send}, _EventContent, State) ->
-    % bufferをみて送信するかどうかを判断する
-    NextStateName = next_state,
-    {next_state, NextStateName, State}.
-
-%% closed state
-closed({timeout, connect}, _EventContent, State) ->
-    % タイムアウトで接続きれたときに再接続
-    NextStateName = next_state,
-    {next_state, NextStateName, State};
-closed({cast, connect}, _EventContent, State) ->
-    % TODO: udpコネクションの初期化
-    {next_state, connected, State};
-closed({cast, send}, _EventContent, State) ->
-    NextStateName = next_state,
-    {next_state, NextStateName, State}.
+%% @private
+%%
+%% @doc
+%% @end
+-spec closed(closed_event(), closed_request(), conn_state()) -> {next_state, state(), conn_state()} |
+                                                                {next_state, state(), conn_state(), actions()}.
+closed({timeout, open}, {reopen, N}, State) -> open_udp(N, State);
+closed(cast, open, State) -> open_udp(0, State);
+closed(cast, {send, Req}, State = #state{buffer = Buff}) ->
+    Data = dogstatsc_datagram:encode(Req),
+    {next_state, closed, State#state{buffer=[Data|Buff]}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -134,19 +143,6 @@ closed({cast, send}, _EventContent, State) ->
 %% gen_statem receives an event from call/2, cast/2, or as a normal
 %% process message, this function is called.
 %%
-%% @spec handle_event(Event, StateName, State) ->
-%%                   {next_state, NextStateName, NextState} |
-%%                   {next_state, NextStateName, NextState, Actions} |
-%%                   {stop, Reason, NewState} |
-%%    				 stop |
-%%                   {stop, Reason :: term()} |
-%%                   {stop, Reason :: term(), NewData :: data()} |
-%%                   {stop_and_reply, Reason, Replies} |
-%%                   {stop_and_reply, Reason, Replies, NewState} |
-%%                   {keep_state, NewData :: data()} |
-%%                   {keep_state, NewState, Actions} |
-%%                   keep_state_and_data |
-%%                   {keep_state_and_data, Actions}
 %% @end
 %%--------------------------------------------------------------------
 handle_event(_EventType, _EventContent, _StateName, State) ->
@@ -164,8 +160,9 @@ handle_event(_EventType, _EventContent, _StateName, State) ->
 %% @spec terminate(Reason, StateName, State) -> void()
 %% @end
 %%--------------------------------------------------------------------
-terminate(_Reason, _StateName, _State) ->
-    ok.
+terminate(_Reason, _StateName, #state{sock = Sock}) ->
+    dogstatsc_pool:delete(self()),
+    gen_udp:close(Sock).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -182,3 +179,37 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+open_udp(N, State) ->
+    case gen_udp:open(0, ?UDP_OPTS) of
+        {ok, Sock} ->
+            {next_state, opened, State#state{sock = Sock}};
+        {error, Reason} ->
+            error_logger:error_msg("open_udp failed: ~p", [Reason]),
+            {next_state, closed, State, reopen_actions(N+1)}
+    end.
+
+% send data and buffers.
+send(Sock, Host, Port, [], Data) ->
+    % io:format("data: ~p~n", [Data]),
+    case gen_udp:send(Sock, Host, Port, Data) of
+        ok -> ok;
+        {error, Reason} -> {error, Reason, Data}
+    end;
+send(Sock, Host, Port, Buff = [H|Rest], Data) ->
+    % io:format("buff: ~p~n", [Buff]),
+    case gen_udp:send(Sock, Host, Port, H) of
+        ok ->
+            send(Sock, Host, Port, Rest, Data);
+        {error, Reason} ->
+            {error, Reason, Buff}
+    end.
+
+reopen_actions(N) ->
+    [{{timeout, open}, backoff(N), {reopen, N}}].
+
+backoff(1) -> 1000;
+backoff(2) -> 1000;
+backoff(3) -> 2000;
+backoff(4) -> 3000;
+backoff(5) -> 5000;
+backoff(_N) -> 8000.
