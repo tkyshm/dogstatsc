@@ -92,11 +92,11 @@
 -type priority() :: normal | low.
 -type raw_request() :: binary().
 -type tags() :: [{atom()|string()|binary(), string()}].
+-type request() :: metrics() | events() | service_check().
 
 -opaque metrics() :: #metrics{}.
 -opaque events() :: #events{}.
 -opaque service_check() :: #service_check{}.
--opaque request() :: metrics() | events() | service_check().
 
 %% @doc
 %% new a metrics request record
