@@ -32,11 +32,11 @@ var      | description
 -------- | -------------------------------------
 port     | dogstatsd port (default: 8125)
 host     | dogstatsd port (default: localhost)
-conn_num | number of udp client workers
+conn_num | number of udp client workers (default: 2)
 
 - sample config
 ```erlang
 [
-  {dogstatsc, [{port, 8125}, {port, 'localhost'}, {conn_num, 2}]}
+  {dogstatsc, [{port, 8125}, {host, 'localhost'}, {conn_num, 2}]}
 ].
 ```
